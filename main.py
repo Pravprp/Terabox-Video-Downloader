@@ -13,7 +13,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "Send me any video link, and I will generate a watch online button for you!")
+    bot.reply_to(message, "Send me any video link, and I will generate watch/download buttons for you!")
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
@@ -21,18 +21,30 @@ def handle_message(message):
     
     # Check if the user sent a valid URL
     if text.startswith('http://') or text.startswith('https://'):
-        base_url = "https://www.teraboxdownloader.pro/p/fs.html?q="
-        final_url = base_url + text
+        
+        # Generate the two different server URLs
+        final_url_1 = "https://www.teraboxdownloader.pro/p/fs.html?q=" + text
+        final_url_2 = "https://teradownloader.com/download?l=" + text
 
-        # Create the inline button using WebAppInfo to skip the popup
         markup = InlineKeyboardMarkup()
-        button = InlineKeyboardButton(
-            text="Watch Video Online 🎬", 
-            web_app=WebAppInfo(url=final_url)
+        
+        # Create Button 1 (Server 1)
+        button1 = InlineKeyboardButton(
+            text="Watch / Download Server 1", 
+            web_app=WebAppInfo(url=final_url_1)
         )
-        markup.add(button)
+        
+        # Create Button 2 (Server 2)
+        button2 = InlineKeyboardButton(
+            text="Watch / Download Server 2", 
+            web_app=WebAppInfo(url=final_url_2)
+        )
+        
+        # Adding them one by one stacks them vertically, which looks cleaner for long button names
+        markup.add(button1)
+        markup.add(button2)
 
-        bot.reply_to(message, "Here is your generated link:", reply_markup=markup)
+        bot.reply_to(message, "Choose a server below:", reply_markup=markup)
     else:
         bot.reply_to(message, "Please send a valid link starting with http:// or https://")
 
