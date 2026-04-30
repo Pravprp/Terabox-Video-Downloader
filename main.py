@@ -1,6 +1,6 @@
 import os
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from keep_alive import keep_alive
 
 # We fetch the token from Render's environment variables for security
@@ -24,9 +24,12 @@ def handle_message(message):
         base_url = "https://www.teraboxdownloader.pro/p/fs.html?q="
         final_url = base_url + text
 
-        # Create the inline button
+        # Create the inline button using WebAppInfo to skip the popup
         markup = InlineKeyboardMarkup()
-        button = InlineKeyboardButton(text="Watch Video Online 🎬", url=final_url)
+        button = InlineKeyboardButton(
+            text="Watch Video Online 🎬", 
+            web_app=WebAppInfo(url=final_url)
+        )
         markup.add(button)
 
         bot.reply_to(message, "Here is your generated link:", reply_markup=markup)
