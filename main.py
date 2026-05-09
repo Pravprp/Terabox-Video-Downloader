@@ -1,26 +1,36 @@
 import os
-import time
-import telebot
 import re
-import threading
-from collections import defaultdict
+import asyncio
 from urllib.parse import urlparse
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from collections import defaultdict
+
+from aiogram import Bot, Dispatcher, F, types, Router
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.enums import ParseMode
+
 from keep_alive import keep_alive
 
-# Fetch the token from Render's environment variables
+# Fetch token
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-
 if not BOT_TOKEN:
     raise ValueError("No BOT_TOKEN found. Please set it in your environment variables.")
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# Initialize Bot, Dispatcher, and Router
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
-# Create a queue/lock system for each user so rapid forwarded messages process sequentially
-user_locks = defaultdict(threading.Lock)
+# --- STATS & QUEUE SETUP ---
+active_tasks_count = 0
+stats_lock = asyncio.Lock()
+
+# This acts as our "Celery + Redis" replacement. 
+# It holds links in a queue until a worker is ready.
+task_queue = asyncio.Queue()
 
 def is_valid_terabox_url(url):
-    """Safely validates if the URL is a real Terabox link."""
     try:
         parsed = urlparse(url)
         if parsed.scheme in ['http', 'https'] and 'terabox' in parsed.netloc.lower():
@@ -29,88 +39,127 @@ def is_valid_terabox_url(url):
     except Exception:
         return False
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
+# --- COMMANDS ---
+
+@router.message(Command("start", "help"))
+async def send_welcome(message: types.Message):
     if message.chat.type != 'private':
         return
+    await message.reply("Send or forward me any Terabox video link, and I will generate watch/download buttons for you!")
+
+@router.message(Command("stats"))
+async def send_stats(message: types.Message):
+    if message.chat.type != 'private':
+        return
+    
+    # Safely read the current active count
+    async with stats_lock:
+        current_count = active_tasks_count
         
-    bot.reply_to(message, "Send or forward me any Terabox video link, and I will generate watch/download buttons for you! You can even forward multiple messages at once.")
+    # Check how many items are waiting in the queue
+    queue_size = task_queue.qsize()
+    
+    stats_text = (
+        f"📊 **Bot Statistics**\n\n"
+        f"🟢 Active Processing Tasks: `{current_count}`\n"
+        f"⏳ Links Waiting in Queue: `{queue_size}`"
+    )
+    await message.reply(stats_text, parse_mode="Markdown")
 
-# Added content_types to catch forwarded videos/photos that have links in their captions
-@bot.message_handler(content_types=['text', 'photo', 'video', 'document'])
-def handle_message(message):
+# --- MESSAGE HANDLER ---
+
+@router.message(F.text | F.caption)
+async def handle_message(message: types.Message):
     if message.chat.type != 'private':
         return
 
-    chat_id = message.chat.id
-    
-    # Extract text from a normal message OR a media caption
     text_content = message.text or message.caption or ""
-    
-    # Find all URLs in the message using regex
     all_urls = re.findall(r'(https?://[^\s]+)', text_content)
-    
-    # Filter out anything that isn't a Terabox link
     valid_urls = [url for url in all_urls if is_valid_terabox_url(url)]
     
-    # Check if the message was forwarded
-    is_forwarded = bool(message.forward_date)
+    is_forwarded = message.forward_date is not None
 
     if not valid_urls:
-        # If it's a forwarded message without links, ignore it silently so we don't spam the user.
-        # Only scold them if they manually typed an invalid link.
-        if not is_forwarded and text_content.strip():
-            bot.reply_to(message, "❌ Invalid Link. Please send a valid Terabox link starting with http:// or https://")
+        if not is_forwarded and text_content.strip() and not text_content.startswith('/'):
+            await message.reply("❌ Invalid Link. Please send a valid Terabox link starting with http:// or https://")
         return
 
-    # Acquire the lock for this specific user. 
-    # If 5 messages are forwarded at once, they will line up here and process one by one.
-    with user_locks[chat_id]:
-        for url in valid_urls:
-            process_single_link(message, url)
+    # Instead of processing immediately, put them in our Task Queue
+    for url in valid_urls:
+        await task_queue.put({"message": message, "url": url})
+        
+    # Optional: Tell the user their links are queued if they sent multiple
+    if len(valid_urls) > 1:
+        await message.reply(f"✅ Added {len(valid_urls)} links to the processing queue!")
 
-def process_single_link(message, url):
-    """Handles the UI animation and button generation for a single link."""
+# --- WORKER & PROCESSING LOGIC ---
+
+async def process_single_link(message: types.Message, url: str):
+    """The actual processing logic that updates the UI."""
+    global active_tasks_count
+    
+    # Increment counter
+    async with stats_lock:
+        active_tasks_count += 1
+        
     try:
-        # 1. Initial Status (Shows a snippet of the URL so they know which one is processing)
         short_url = url[:30] + "..." if len(url) > 30 else url
-        status_message = bot.reply_to(message, f"⏳ Analysing Link...\n{short_url}")
-        time.sleep(1.5)
+        
+        # 1. Initial Status
+        status_message = await message.reply(f"⏳ Analysing Link...\n{short_url}")
+        await asyncio.sleep(1.0) # Non-blocking sleep!
         
         # 2. Processing
-        bot.edit_message_text(
-            chat_id=status_message.chat.id, 
-            message_id=status_message.message_id, 
-            text=f"🔄 Processing...\n{short_url}"
-        )
-        time.sleep(1.5)
+        await status_message.edit_text(f"🔄 Processing...\n{short_url}")
+        await asyncio.sleep(1.0) # Non-blocking sleep!
 
         # 3. Generating Buttons
         final_url_1 = f"https://www.teraboxdownloader.pro/p/fs.html?q={url}"
         final_url_2 = f"https://teradownloader.com/download?l={url}"
 
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton(text="Watch / Download Server 1", web_app=WebAppInfo(url=final_url_1)))
-        markup.add(InlineKeyboardButton(text="Watch / Download Server 2", web_app=WebAppInfo(url=final_url_2)))
+        # aiogram v3 UI generation
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Watch / Download Server 1", web_app=WebAppInfo(url=final_url_1))],
+            [InlineKeyboardButton(text="Watch / Download Server 2", web_app=WebAppInfo(url=final_url_2))]
+        ])
 
         # Final Update
-        bot.edit_message_text(
-            chat_id=status_message.chat.id, 
-            message_id=status_message.message_id, 
-            text="✅ Choose a server below:", 
-            reply_markup=markup
-        )
+        await status_message.edit_text("✅ Choose a server below:", reply_markup=markup)
         
-        # Small delay at the end of each link to protect against Telegram rate limits
-        time.sleep(0.5)
-        
+        # Tiny delay to respect Telegram's rate limits
+        await asyncio.sleep(0.5)
+
     except Exception as e:
         print(f"Error handling message: {e}")
-        bot.send_message(message.chat.id, "⚠️ An error occurred while processing this link. Please try again.")
+        await message.answer("⚠️ An error occurred while processing this link. Please try again.")
+        
+    finally:
+        # Decrement counter safely
+        async with stats_lock:
+            active_tasks_count -= 1
 
-# 1. Start the web server for UptimeRobot
-keep_alive()
+async def worker_loop():
+    """Continuously pulls tasks from the queue and processes them."""
+    while True:
+        task = await task_queue.get()
+        await process_single_link(task["message"], task["url"])
+        task_queue.task_done()
 
-# 2. Start the Telegram bot
-print("Bot is running...")
-bot.infinity_polling()
+# --- MAIN RUNNER ---
+
+async def main():
+    # 1. Start the keep_alive server (Flask runs in its own thread)
+    keep_alive()
+    
+    # 2. Start our background workers. 
+    # Creating 3 workers means the bot can process 3 links at the EXACT same time globally.
+    # The rest wait gracefully in the queue.
+    for _ in range(3):
+        asyncio.create_task(worker_loop())
+    
+    # 3. Start the bot
+    print("Async Bot is running...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
