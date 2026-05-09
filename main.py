@@ -6,7 +6,7 @@ from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, F, types, Router
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 
 from keep_alive import keep_alive
@@ -64,7 +64,7 @@ async def send_stats(message: types.Message):
         f"🟢 Active Processing Tasks: `{current_count}`\n"
         f"⏳ Links Waiting in Queue: `{queue_size}`"
     )
-    await message.reply(stats_text, parse_mode="Markdown")
+    await message.reply(stats_text, parse_mode=ParseMode.MARKDOWN)
 
 # --- MESSAGE HANDLER ---
 
@@ -117,10 +117,10 @@ async def process_single_link(message: types.Message, url: str):
         final_url_1 = f"https://www.teraboxdownloader.pro/p/fs.html?q={url}"
         final_url_2 = f"https://teradownloader.com/download?l={url}"
 
-        # aiogram v3 UI generation
+        # aiogram v3 UI generation - Using standard 'url' parameter opens in browser
         markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Watch / Download Server 1", web_app=WebAppInfo(url=final_url_1))],
-            [InlineKeyboardButton(text="Watch / Download Server 2", web_app=WebAppInfo(url=final_url_2))]
+            [InlineKeyboardButton(text="Watch / Download Server 1", url=final_url_1)],
+            [InlineKeyboardButton(text="Watch / Download Server 2", url=final_url_2)]
         ])
 
         # Final Update
@@ -153,7 +153,6 @@ async def main():
     
     # 2. Start our background workers. 
     # Creating 3 workers means the bot can process 3 links at the EXACT same time globally.
-    # The rest wait gracefully in the queue.
     for _ in range(3):
         asyncio.create_task(worker_loop())
     
