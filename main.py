@@ -1,6 +1,10 @@
 import os
 import time
 import telebot
+import re
+import threading
+from collections import defaultdict
+from urllib.parse import urlparse
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from keep_alive import keep_alive
 
@@ -12,83 +16,97 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# Create a queue/lock system for each user so rapid forwarded messages process sequentially
+user_locks = defaultdict(threading.Lock)
+
+def is_valid_terabox_url(url):
+    """Safely validates if the URL is a real Terabox link."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme in ['http', 'https'] and 'terabox' in parsed.netloc.lower():
+            return True
+        return False
+    except Exception:
+        return False
+
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    # Ignore commands sent in groups/channels
     if message.chat.type != 'private':
         return
         
-    bot.reply_to(message, "Send me any Terabox video link, and I will generate watch/download buttons for you!")
+    bot.reply_to(message, "Send or forward me any Terabox video link, and I will generate watch/download buttons for you! You can even forward multiple messages at once.")
 
-@bot.message_handler(func=lambda message: True)
+# Added content_types to catch forwarded videos/photos that have links in their captions
+@bot.message_handler(content_types=['text', 'photo', 'video', 'document'])
 def handle_message(message):
-    # 1. STRICTLY PRIVATE DMs ONLY
-    # If the message is from a group, supergroup, or channel, ignore it completely.
     if message.chat.type != 'private':
         return
 
-    text = message.text.strip()
+    chat_id = message.chat.id
     
-    # 2. Basic check: Is it a URL at all?
-    if not (text.startswith('http://') or text.startswith('https://')):
-        bot.reply_to(message, "Please send a valid link starting with http:// or https://")
+    # Extract text from a normal message OR a media caption
+    text_content = message.text or message.caption or ""
+    
+    # Find all URLs in the message using regex
+    all_urls = re.findall(r'(https?://[^\s]+)', text_content)
+    
+    # Filter out anything that isn't a Terabox link
+    valid_urls = [url for url in all_urls if is_valid_terabox_url(url)]
+    
+    # Check if the message was forwarded
+    is_forwarded = bool(message.forward_date)
+
+    if not valid_urls:
+        # If it's a forwarded message without links, ignore it silently so we don't spam the user.
+        # Only scold them if they manually typed an invalid link.
+        if not is_forwarded and text_content.strip():
+            bot.reply_to(message, "❌ Invalid Link. Please send a valid Terabox link starting with http:// or https://")
         return
 
-    # 3. Send the first "loading" frame
-    status_message = bot.reply_to(message, "⏳ Analysing Link...")
-    
-    # Wait for 2 seconds to simulate processing
-    time.sleep(2)
-    
-    # 4. Validation check: Does it contain "terabox"? 
-    if 'terabox' not in text.lower():
+    # Acquire the lock for this specific user. 
+    # If 5 messages are forwarded at once, they will line up here and process one by one.
+    with user_locks[chat_id]:
+        for url in valid_urls:
+            process_single_link(message, url)
+
+def process_single_link(message, url):
+    """Handles the UI animation and button generation for a single link."""
+    try:
+        # 1. Initial Status (Shows a snippet of the URL so they know which one is processing)
+        short_url = url[:30] + "..." if len(url) > 30 else url
+        status_message = bot.reply_to(message, f"⏳ Analysing Link...\n{short_url}")
+        time.sleep(1.5)
+        
+        # 2. Processing
         bot.edit_message_text(
             chat_id=status_message.chat.id, 
             message_id=status_message.message_id, 
-            text="Link Creation is failed Due to Invalid Link. Please Provide a Valid link to Proceed 😔"
+            text=f"🔄 Processing...\n{short_url}"
         )
-        return
+        time.sleep(1.5)
 
-    # 5. If the link is valid, continue the animation
-    bot.edit_message_text(
-        chat_id=status_message.chat.id, 
-        message_id=status_message.message_id, 
-        text="🔄 Processing..."
-    )
-    time.sleep(2)
+        # 3. Generating Buttons
+        final_url_1 = f"https://www.teraboxdownloader.pro/p/fs.html?q={url}"
+        final_url_2 = f"https://teradownloader.com/download?l={url}"
 
-    bot.edit_message_text(
-        chat_id=status_message.chat.id, 
-        message_id=status_message.message_id, 
-        text="⚙️ Creating Link..."
-    )
-    time.sleep(2)
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton(text="Watch / Download Server 1", web_app=WebAppInfo(url=final_url_1)))
+        markup.add(InlineKeyboardButton(text="Watch / Download Server 2", web_app=WebAppInfo(url=final_url_2)))
 
-    # 6. Generate the final URLs and Buttons
-    final_url_1 = "https://www.teraboxdownloader.pro/p/fs.html?q=" + text
-    final_url_2 = "https://teradownloader.com/download?l=" + text
-
-    markup = InlineKeyboardMarkup()
-    
-    button1 = InlineKeyboardButton(
-        text="Watch / Download Server 1", 
-        web_app=WebAppInfo(url=final_url_1)
-    )
-    button2 = InlineKeyboardButton(
-        text="Watch / Download Server 2", 
-        web_app=WebAppInfo(url=final_url_2)
-    )
-    
-    markup.add(button1)
-    markup.add(button2)
-
-    # 7. Edit the message one last time to show the final buttons
-    bot.edit_message_text(
-        chat_id=status_message.chat.id, 
-        message_id=status_message.message_id, 
-        text="✅ Choose a server below:", 
-        reply_markup=markup
-    )
+        # Final Update
+        bot.edit_message_text(
+            chat_id=status_message.chat.id, 
+            message_id=status_message.message_id, 
+            text="✅ Choose a server below:", 
+            reply_markup=markup
+        )
+        
+        # Small delay at the end of each link to protect against Telegram rate limits
+        time.sleep(0.5)
+        
+    except Exception as e:
+        print(f"Error handling message: {e}")
+        bot.send_message(message.chat.id, "⚠️ An error occurred while processing this link. Please try again.")
 
 # 1. Start the web server for UptimeRobot
 keep_alive()
